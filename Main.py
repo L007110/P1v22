@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import os
+import importlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -282,7 +284,7 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
         # 补充：为了防止初始车辆数 > 目标数（比如从N=100的检查点加载跑N=80），在每轮开始前做一个简单的检查即可
         if len(overall_vehicle_list) > Parameters.TRAINING_VEHICLE_TARGET:
             overall_vehicle_list = random.sample(overall_vehicle_list, Parameters.TRAINING_VEHICLE_TARGET)
-        # 步骤 1: 车辆移动
+            # 步骤 1: 车辆移动
         global_vehicle_id, overall_vehicle_list = vehicle_movement(
             global_vehicle_id,
             overall_vehicle_list,
@@ -290,6 +292,12 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
         )
 
         loss_list_per_epoch = []
+
+        # === [新增 1/3] 初始化对准统计计数器 ===
+        epoch_aligned_count = 0
+        epoch_total_decisions = 0
+        # ===================================
+
         mean_loss = 0.0
         cumulative_reward_per_epoch = 0.0
         v2i_sum_capacity_mbps = 0.0
@@ -450,11 +458,28 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
                         debug(f"!!! GNN action selection failed: {e}")
                         global_gnn_model.train()
                         choose_action(dqn, RL_ACTION_SPACE, device)
-                else:
-                    choose_action(dqn, RL_ACTION_SPACE, device)
-            else:
-                dqn.curr_state = [0.0] * RL_N_STATES
-                dqn.action = None
+                    else:
+                        choose_action(dqn, RL_ACTION_SPACE, device)
+
+                        # === [新增 2/3] 统计波束是否对准 ===
+                        # 只有当车辆存在且动作不为空时才统计
+                    if dqn.vehicle_exist_curr and dqn.action is not None:
+                        # dqn.action 格式: [beam_width, horizontal, vertical, power]
+                        # 根据 P1v22.xml 里的逻辑:
+                        # horizontal_dir = 1 对应 theta_h = 0 (水平正对)
+                        # vertical_dir = 1   对应 theta_v = 0 (垂直正对)
+                        current_h = dqn.action[1]
+                        current_v = dqn.action[2]
+
+                        if current_h == 1 and current_v == 1:
+                            epoch_aligned_count += 1
+
+                        epoch_total_decisions += 1
+                        # ===================================
+
+                    else:
+                        dqn.curr_state = [0.0] * RL_N_STATES
+                        dqn.action = None
 
         # ==================================================================
         # [修改] 步骤 4.5: 物理状态同步 (Phase 2 Sync)
@@ -635,9 +660,18 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
         debug_print(f"  [Raw Metrics] V2I Penalty Power={avg_breakdown.get('raw_v2i', 0):.2e} W")
 
         if len(loss_list_per_epoch) > 0: mean_loss = np.mean(loss_list_per_epoch)
+
+        # === [新增 3/3] 计算本 Epoch 的对准率 ===
+        if epoch_total_decisions > 0:
+            beam_alignment_ratio = epoch_aligned_count / epoch_total_decisions
+        else:
+            beam_alignment_ratio = 0.0
+        # ======================================
+
+        # [修改调用] 传入 beam_alignment_ratio
         global_logger.log_epoch(epoch, cumulative_reward_per_epoch, mean_loss, mean_delay, p95_delay, mean_snr_db,
                                 len(overall_vehicle_list), v2v_success_rate, v2i_sum_capacity_mbps, v2v_delay_only_rate,
-                                v2v_snr_only_rate)
+                                v2v_snr_only_rate, beam_alignment_ratio=beam_alignment_ratio)
 
         if epoch % TARGET_UPDATE_FREQUENCY == 0:
             if USE_GNN_ENHANCEMENT:
@@ -648,14 +682,30 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
         if epoch == max_epochs:
             global_logger.log_convergence(epoch, mean_loss)
             try:
+                print(f"DEBUG: 训练结束，准备保存模型... GNN模式={USE_GNN_ENHANCEMENT}")
+
                 if USE_GNN_ENHANCEMENT:
-                    torch.save(global_gnn_model.state_dict(), Parameters.MODEL_PATH_GNN)
+                    # GNN 模式保存逻辑
+                    # 也可以在这里强制写死名字，比如 "model_HYBRID.pt"
+                    save_path = Parameters.MODEL_PATH_GNN
+                    torch.save(global_gnn_model.state_dict(), save_path)
+                    print(f"✅ 成功保存 GNN 模型到: {save_path}")
                 else:
-                    path = MODEL_PATH_NO_GNN if USE_DUELING_DQN else MODEL_PATH_DQN
-                    save_data = {f'dqn_{dqn.dqn_id}': dqn.state_dict() for dqn in global_dqn_list}
-                    torch.save(save_data, path)
-            except Exception:
-                pass
+                    # DQN 模式 (use_gnn=False) - 强制构建字典并保存
+                    dqn_dict = {}
+                    for dqn in global_dqn_list:
+                        dqn_dict[f'dqn_{dqn.dqn_id}'] = dqn.state_dict()
+
+                    # 【核心修改】强制命名为 model_DQN.pt，防止和 GNN 模型混淆
+                    save_path = "model_DQN.pt"
+                    torch.save(dqn_dict, save_path)
+                    print(f"✅ 成功保存纯 DQN 字典模型到: {save_path}")
+
+            except Exception as e:
+                print(f"❌ 保存模型失败: {e}")
+                import traceback
+                traceback.print_exc()
+
             global_logger.save_metrics_to_csv()
             break
 
@@ -666,13 +716,21 @@ def rl(mean_loss_across_epochs=None, gnn_optimizer=None, device=None):
 
 
 def run_training(device):
+    # =======================================================
+    # 【核心修复】强制同步全局变量
+    # 解决 from Parameters import * 导致的变量不同步问题
+    # =======================================================
+    global USE_GNN_ENHANCEMENT
+    USE_GNN_ENHANCEMENT = Parameters.USE_GNN_ENHANCEMENT
+
     debug_print(f"--- Run Config: GNN={Parameters.USE_GNN_ENHANCEMENT}, Arch={Parameters.GNN_ARCH} ---")
 
     # 初始化 DQN 列表
     formulate_global_list_dqn(global_dqn_list, device)
 
     gnn_optimizer = None
-    if Parameters.USE_GNN_ENHANCEMENT:
+    # 注意：这里要用同步后的 USE_GNN_ENHANCEMENT 变量，或者 Parameters.USE_GNN_ENHANCEMENT
+    if USE_GNN_ENHANCEMENT:
         import GNNModel
         GNNModel.global_gnn_model = GNNModel.EnhancedHeteroGNN(node_feature_dim=12, hidden_dim=64, num_heads=4,
                                                                num_layers=2, dropout=0.2).to(device)
@@ -688,69 +746,141 @@ def run_training(device):
 
 
 def test():
-    debug_print("========== STARTING SCALABILITY TEST MODE ==========")
+    debug_print("========== STARTING SCALABILITY TEST MODE (ALL BASELINES) ==========")
     set_debug_mode(False)
+
+    # 请修改为你实际的绝对路径
+    base_path = r"D:\pythonProject\pythonProject2\GNNDQN\P1v22"
+
     test_scenarios = {
-        "GNN-DRL": {"model_path": MODEL_PATH_GNN, "use_gnn": True},
-        "No-GNN DRL": {"model_path": MODEL_PATH_NO_GNN, "use_gnn": False},
-        "Standard DQN": {"model_path": MODEL_PATH_DQN, "use_gnn": False}
+        # 1. Proposed (HYBRID)
+        "Proposed (HYBRID)": {
+            "model_path": os.path.join(base_path, "model_HYBRID.pt"),
+            "gnn_arch": "HYBRID",
+            "use_gnn": True
+        },
+        # 2. Ablation (GCN)
+        "Ablation (GCN)": {
+            "model_path": os.path.join(base_path, "model_GCN.pt"),
+            "gnn_arch": "GCN",
+            "use_gnn": True
+        },
+        # 3. Baseline (DQN)
+        "Baseline (DQN)": {
+            "model_path": os.path.join(base_path, "model_DQN.pt"),
+            "gnn_arch": "HYBRID",  # DQN 不用 GNN，这个参数无所谓
+            "use_gnn": False
+        },
+        # 4. Random
+        "Random": {
+            "model_path": None,
+            "gnn_arch": "HYBRID",
+            "use_gnn": False
+        }
     }
+
     results = []
-    global_gnn_model.to(device)
-    global_gnn_model.eval()
+
+    # 引入 importlib 用于动态重载架构
+    import importlib
+    import GNNModel
 
     for model_name, config in test_scenarios.items():
         debug_print(f"--- Testing Model: {model_name} ---")
-        Parameters.USE_GNN_ENHANCEMENT = config["use_gnn"]
-        Parameters.USE_DUELING_DQN = True if model_name != "Standard DQN" else False
+
+        # 1. 动态切换架构关键步骤
+        if config["use_gnn"]:
+            # 修改全局参数
+            Parameters.GNN_ARCH = config["gnn_arch"]
+            Parameters.USE_GNN_ENHANCEMENT = True
+
+            # 【核心黑科技】: 强制重新加载 GNNModel 模块
+            # 这会触发 GNNModel.py 里的初始化代码，根据新的 GNN_ARCH 创建新的 global_gnn_model
+            importlib.reload(GNNModel)
+            from GNNModel import global_gnn_model  # 重新获取新的实例
+
+            global_gnn_model.to(device)
+            global_gnn_model.eval()
+        else:
+            Parameters.USE_GNN_ENHANCEMENT = False
+            # DQN 模式不需要重载 GNN，保持原状即可
+
+        # 2. 统一设置 Dueling
+        Parameters.USE_DUELING_DQN = True
         is_gnn_model = Parameters.USE_GNN_ENHANCEMENT
 
+        # 重置 DQN 列表
         formulate_global_list_dqn(global_dqn_list, device)
+
+        # 3. 加载权重
         try:
-            if is_gnn_model:
-                global_gnn_model.load_state_dict(torch.load(config["model_path"], map_location=device))
-                global_gnn_model.eval()
-            else:
-                checkpoint = torch.load(config["model_path"], map_location=device)
+            if model_name == "Random":
+                print(f"  > Mode: Random Strategy (Epsilon = 1.0)")
                 for dqn in global_dqn_list:
+                    dqn.epsilon = 1.0
+                    dqn.eval()
+
+            elif is_gnn_model:
+                path = config["model_path"]
+                if not os.path.exists(path):
+                    print(f"  [Error] Skipping {model_name}: File not found at {path}")
+                    continue
+                print(f"  > Loading {config['gnn_arch']} model from: {path}")
+
+                # 现在 global_gnn_model 的架构已经匹配了，加载不会报错
+                global_gnn_model.load_state_dict(torch.load(path, map_location=device))
+                global_gnn_model.eval()
+                for dqn in global_dqn_list: dqn.epsilon = 0.0
+
+            else:  # DQN
+                path = config["model_path"]
+                if not os.path.exists(path):
+                    print(f"  [Error] Skipping {model_name}: File not found at {path}")
+                    continue
+                print(f"  > Loading DQN model from: {path}")
+                checkpoint = torch.load(path, map_location=device)
+                for dqn in global_dqn_list:
+                    # 这里的 checkpoint 必须是字典结构
                     dqn.load_state_dict(checkpoint[f'dqn_{dqn.dqn_id}'])
                     dqn.eval()
-        except Exception:
+                    dqn.epsilon = 0.0
+
+        except Exception as e:
+            print(f"  [Exception] Error loading model {model_name}: {e}")
+            print("  >>> 建议: 检查文件是否对应。DQN 模型必须由 No-GNN 模式训练生成。")
             continue
 
+        # --- 以下是标准的测试循环 (保持你之前的逻辑不变) ---
         for vehicle_count in TEST_VEHICLE_COUNTS:
             debug_print(f"  Testing with {vehicle_count} vehicles...")
+
             episode_v2v_success_rates = []
             episode_p95_delays_ms = []
             episode_v2i_capacities = []
             episode_decision_times = []
+            episode_bars = []
+
             global_vehicle_id = 0
             overall_vehicle_list = []
 
-            print(f"    >>> Warming up environment to reach {vehicle_count} vehicles...")
-            # 跑 50-100 步，只移动和生车，不计算 Reward，不计入统计
-            for _ in range(100):
-                global_vehicle_id, overall_vehicle_list = vehicle_movement(
-                    global_vehicle_id, overall_vehicle_list, target_count=vehicle_count
-                )
-            # 再多跑 50 步，让刚生成的车从边缘开到路中间
             for _ in range(50):
                 global_vehicle_id, overall_vehicle_list = vehicle_movement(
                     global_vehicle_id, overall_vehicle_list, target_count=vehicle_count
                 )
-            print(f"    >>> Ready. Current vehicles: {len(overall_vehicle_list)}")
 
             for i_episode in range(TEST_EPISODES_PER_COUNT):
                 global_vehicle_id, overall_vehicle_list = vehicle_movement(global_vehicle_id, overall_vehicle_list,
                                                                            target_count=vehicle_count)
                 active_v2v_interferers = []
                 step_decision_times = []
+                ep_aligned = 0
+                ep_total = 0
 
-                # First Loop: 动作选择 & 构建干扰列表
                 for dqn in global_dqn_list:
                     dqn.vehicle_exist_curr = False
                     base_state = []
                     dqn.vehicle_in_dqn_range_by_distance = []
+
                     for vehicle in overall_vehicle_list:
                         if (dqn.start[0] <= vehicle.curr_loc[0] <= dqn.end[0] and dqn.start[1] <= vehicle.curr_loc[1] <=
                                 dqn.end[1]):
@@ -761,6 +891,7 @@ def test():
                     dqn.vehicle_in_dqn_range_by_distance.sort(key=lambda x: x.distance_to_bs, reverse=False)
 
                     if dqn.vehicle_exist_curr:
+                        # --- 状态构建 (请确保和你原代码一致) ---
                         iState = 0
                         for iVehicle in range(min(RL_N_STATES_BASE // 4, len(dqn.vehicle_in_dqn_range_by_distance))):
                             base_state.append(dqn.vehicle_in_dqn_range_by_distance[iVehicle].curr_loc[0])
@@ -777,7 +908,6 @@ def test():
                             dqn.update_csi_states(dqn.vehicle_in_dqn_range_by_distance, is_current=True)
                         if not hasattr(dqn, 'prev_v2i_interference'): dqn.prev_v2i_interference = 0.0
 
-                        # [V2I 维度修复]
                         interf_log = np.log10(dqn.prev_v2i_interference + 1e-20)
                         interf_norm = (interf_log + 20) / 14.0
 
@@ -790,11 +920,10 @@ def test():
                             dir_x, dir_y = dx / d, dy / d
 
                         v2i_state = [interf_norm, dir_x, dir_y]
-
                         dqn.curr_state = base_state + dqn.csi_states_curr + v2i_state
-                        dqn.epsilon = 0.0
 
-                        if is_gnn_model:
+                        # --- 动作选择 ---
+                        if is_gnn_model and model_name != "Random":
                             try:
                                 start_t = time.time()
                                 graph_data_local = move_graph_to_device(
@@ -809,10 +938,17 @@ def test():
                             except Exception:
                                 choose_action(dqn, RL_ACTION_SPACE, device)
                         else:
+                            start_t = time.time()
                             choose_action(dqn, RL_ACTION_SPACE, device)
-                            if not is_gnn_model: step_decision_times.append(dqn.last_decision_time)
+                            if not is_gnn_model:
+                                dqn.last_decision_time = (time.time() - start_t) * 1000.0
+                                step_decision_times.append(dqn.last_decision_time)
 
                         if dqn.action is not None and USE_UMI_NLOS_MODEL:
+                            if dqn.action[1] == 1 and dqn.action[2] == 1:
+                                ep_aligned += 1
+                            ep_total += 1
+
                             beam_count = dqn.action[0] + 1
                             horizontal_dir = dqn.action[1]
                             vertical_dir = dqn.action[2]
@@ -820,38 +956,24 @@ def test():
                             directional_gain = new_reward_calculator._calculate_directional_gain(horizontal_dir,
                                                                                                  vertical_dir)
                             total_power_W = TRANSMITTDE_POWER * power_ratio * beam_count * directional_gain
-                            # 1. 获取正在服务的车辆 (发射源)
                             serving_vehicle = dqn.vehicle_in_dqn_range_by_distance[0]
-
-                            # 2. 使用车辆的位置作为发射源位置
                             active_v2v_interferers.append(
                                 {'tx_pos': serving_vehicle.curr_loc, 'power_W': total_power_W})
                     else:
                         dqn.action = None
 
-
-                # Second Loop: 在 test() 循环中补充 V2V 链路计算
-                # 利用已经构建好的 active_v2v_interferers
                 for dqn in global_dqn_list:
                     if dqn.vehicle_exist_curr and dqn.vehicle_in_dqn_range_by_distance:
-                        # 借用 reward calculator 中的记录函数，或者手动计算
-                        # 注意：需要传入 active_v2v_interferers
                         new_reward_calculator.calculate_complete_reward(
-                            dqn,
-                            dqn.vehicle_in_dqn_range_by_distance,
-                            dqn.action,
-                            active_v2v_interferers
+                            dqn, dqn.vehicle_in_dqn_range_by_distance, dqn.action, active_v2v_interferers
                         )
                     else:
-                        # 如果没有车或未激活，记录默认失败值
                         if not hasattr(dqn, 'delay_list'): dqn.delay_list = []
                         if not hasattr(dqn, 'snr_list'): dqn.snr_list = []
                         if not hasattr(dqn, 'v2v_success_list'): dqn.v2v_success_list = []
-                        # 记录一次失败数据，保持列表长度一致
                         dqn.delay_list.append(1.0)
                         dqn.snr_list.append(-100.0)
                         dqn.v2v_success_list.append(0)
-
 
                 total_v2i_capacity_bps = 0.0
                 for link in V2I_LINK_POSITIONS:
@@ -865,6 +987,7 @@ def test():
                         d = global_channel_model.calculate_3d_distance(interf['tx_pos'], v2i_rx_pos)
                         pl, _, _ = global_channel_model.calculate_path_loss(d)
                         total_interf += interf['power_W'] * (10 ** (-pl / 10))
+
                     total_v2i_capacity_bps += SYSTEM_BANDWIDTH * np.log2(
                         1 + v2i_sig / (total_interf + global_channel_model._calculate_noise_power(SYSTEM_BANDWIDTH)))
                 v2i_sum_capacity_mbps = total_v2i_capacity_bps / 1e6
@@ -873,22 +996,32 @@ def test():
                 episode_v2v_success_rates.append(v2v_success_rate)
                 episode_p95_delays_ms.append(p95_delay * 1000)
                 episode_v2i_capacities.append(v2i_sum_capacity_mbps)
-                if step_decision_times: episode_decision_times.append(
-                    np.mean(step_decision_times) if is_gnn_model else np.sum(step_decision_times))
+                if step_decision_times:
+                    episode_decision_times.append(
+                        np.mean(step_decision_times) if is_gnn_model else np.sum(step_decision_times))
+                episode_bars.append(ep_aligned / ep_total if ep_total > 0 else 0.0)
+
                 for dqn in global_dqn_list:
                     dqn.delay_list = []
                     dqn.snr_list = []
                     dqn.v2v_success_list = []
 
             results.append({
-                "model": model_name, "vehicle_count": vehicle_count,
+                "model": model_name,
+                "vehicle_count": vehicle_count,
                 "v2v_success_rate": np.mean(episode_v2v_success_rates),
                 "v2i_sum_capacity_mbps": np.mean(episode_v2i_capacities),
                 "p95_delay_ms": np.mean(episode_p95_delays_ms),
-                "decision_time_ms": np.mean(episode_decision_times) if episode_decision_times else 0.0
+                "decision_time_ms": np.mean(episode_decision_times) if episode_decision_times else 0.0,
+                "beam_alignment_ratio": np.mean(episode_bars)
             })
-    pd.DataFrame(results).to_csv(f"{global_logger.log_dir}/scalability{Parameters.ABLATION_SUFFIX}.csv", index=False)
 
+    try:
+        csv_path = f"{global_logger.log_dir}/scalability_FINAL_COMPARISON.csv"
+        pd.DataFrame(results).to_csv(csv_path, index=False)
+        print(f"All tests finished. Results saved to {csv_path}")
+    except Exception as e:
+        print(f"Error saving results: {e}")
 
 if __name__ == "__main__":
     # 1. 基础设置
@@ -961,6 +1094,8 @@ if __name__ == "__main__":
 
     # 3.3 [关键] 处理 Boolean 类型的字符串转换
     use_gnn_flag = (args.use_gnn.lower() == "true")
+
+    Parameters.USE_GNN_ENHANCEMENT = use_gnn_flag
 
     # 处理 Dueling DQN 开关
     if args.dueling.lower() == "false":

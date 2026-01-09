@@ -7,8 +7,8 @@ import Main
 import Parameters
 
 # ================= 配置区域 =================
-# 1. 指定要测试的模型文件 (指向 V2 训练产出的文件)
-TARGET_MODEL_PATH = "model_Universal_LargeMap_MixV4.pt"
+# 1. 指定要测试的模型文件 (指向训练产出的文件)
+TARGET_MODEL_PATH = "model_Gated_Verification_N20.pt"
 
 # 2. 指定测试场景 (必须覆盖默认值，确保测试 N=20/40 等低密度场景)
 TEST_SCENARIOS = [20, 40, 60, 80, 100, 120, 140]

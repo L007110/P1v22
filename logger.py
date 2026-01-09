@@ -112,7 +112,8 @@ class TrainingLogger:
 
     def log_epoch(self, epoch, cumulative_reward, mean_loss, mean_delay, p95_delay,
                   mean_snr, vehicle_count, v2v_success_rate, v2i_sum_capacity,
-                  v2v_delay_only_rate=None, v2v_snr_only_rate=None):
+                  v2v_delay_only_rate=None, v2v_snr_only_rate=None,
+                  beam_alignment_ratio=None):  # <--- [1. 新增参数]
         """记录每个epoch的全局指标 """
         # 安全转换所有值为正确的类型
         cumulative_reward_float = self._convert_tensor_to_float(cumulative_reward)
@@ -129,6 +130,10 @@ class TrainingLogger:
         v2v_snr_only_rate_float = self._convert_tensor_to_float(
             v2v_snr_only_rate if v2v_snr_only_rate is not None else 0.0)
 
+        # --- [2. 新增转换逻辑] ---
+        beam_alignment_ratio_float = self._convert_tensor_to_float(
+            beam_alignment_ratio if beam_alignment_ratio is not None else 0.0)
+
         self.metrics['epoch'].append(epoch)
         self.metrics['cumulative_reward'].append(cumulative_reward_float)
         self.metrics['mean_loss'].append(mean_loss_float)
@@ -142,6 +147,12 @@ class TrainingLogger:
         self.metrics['v2v_delay_only_rate'].append(v2v_delay_only_rate_float)
         self.metrics['v2v_snr_only_rate'].append(v2v_snr_only_rate_float)
 
+        # --- [3. 新增保存逻辑] ---
+        # 确保 metrics 字典里有这个 key
+        if 'beam_alignment_ratio' not in self.metrics:
+            self.metrics['beam_alignment_ratio'] = []
+        self.metrics['beam_alignment_ratio'].append(beam_alignment_ratio_float)
+
         # 更新训练统计
         self.training_stats['total_epochs'] = epoch
         if cumulative_reward_float > self.training_stats['best_reward']:
@@ -153,8 +164,9 @@ class TrainingLogger:
             f"Loss: {mean_loss_float:7.4f} | "
             f"Reward: {cumulative_reward_float:8.3f} | "
             f"V2V Success: {v2v_success_rate_float:6.2%} | "
+            f"BAR: {beam_alignment_ratio_float:6.2%} | "  # <--- [4. 在日志里显示]
             f"V2I Cap: {v2i_sum_capacity_float:7.2f} Mbps | "
-            f"Delay (Avg/P95): {mean_delay_float * 1000:6.2f}ms / {p95_delay_float * 1000:6.2f}ms | "  
+            f"Delay (Avg/P95): {mean_delay_float * 1000:6.2f}ms / {p95_delay_float * 1000:6.2f}ms | "
             f"SNR: {mean_snr_float:6.2f}dB | "
             f"Vehicles: {vehicle_count_int:3d}"
         )
